@@ -368,6 +368,241 @@ String backendFor(String key) {
           ]
         }}
     ]},
+    { name: "RabbitMQ Deep Dive", items: [
+      { id: "sd-39", t: "RabbitMQ's core model: Producer → Exchange → Binding → Queue → Consumer", d: "Medium",
+        desc: "The one fact that trips up everyone coming from Kafka/SQS: a producer never publishes directly to a queue — it always publishes to an exchange.",
+        notes: {
+          explain: [
+            "RabbitMQ implements AMQP, and AMQP's whole design centers on decoupling 'where a message is sent' from 'where it ends up.' A producer publishes a message to an EXCHANGE with a routing key attached. The exchange doesn't store anything — its only job is to look at its bindings (rules) and decide which queue(s), if any, the message should be copied into. A queue is the only thing that actually stores messages, and a consumer only ever reads from a queue, never from an exchange directly.",
+            "This is the single biggest conceptual difference from Kafka (producer writes straight into a partition) or SQS (producer writes straight into a queue): RabbitMQ inserts a routing layer between publish and storage, which is what makes fanout, pattern-based routing, and content-based routing possible without the producer knowing anything about consumers."
+          ],
+          diagram: {
+            type: "flow",
+            caption: "Even publishing 'directly to a queue' in client libraries is really publishing to the nameless default exchange with the queue name as the routing key.",
+            steps: [
+              { label: "Producer", note: "publishes with a routing key" },
+              { label: "Connection + Channel", note: "TCP + lightweight virtual conn", arrowLabel: "→" },
+              { label: "Exchange", note: "routing logic only, stores nothing", arrowLabel: "→" },
+              { label: "Bindings", note: "rules: which queues match", arrowLabel: "→" },
+              { label: "Queue", note: "actual message storage", arrowLabel: "→" },
+              { label: "Consumer", note: "reads + acks", arrowLabel: "→" }
+            ]
+          },
+          tricks: [
+            "'Publish to a queue' is a common but technically imprecise phrase — even the simplest client call publishes to the built-in nameless default exchange, which has an implicit binding to every queue using the queue's name as the routing key. Knowing this distinction is a strong, cheap signal in an interview.",
+            "If a message doesn't match any binding, it's silently dropped by default — the exchange doesn't error, doesn't queue it anywhere, it just vanishes. Setting the `mandatory` flag on publish is what makes RabbitMQ return it to the publisher instead."
+          ]
+        }
+      },
+      { id: "sd-40", t: "Connections vs. Channels", d: "Medium",
+        desc: "A Connection is a real TCP socket; a Channel is a cheap, lightweight virtual connection multiplexed inside it — this is why you open one connection per app and many channels inside it, not the reverse.",
+        notes: {
+          explain: [
+            "Opening and tearing down a TCP connection (plus the AMQP handshake/auth on top of it) is comparatively expensive. If every publish or consume operation needed its own connection, a busy service would spend more time negotiating sockets than doing useful work. A Channel solves this: it's a lightweight, independent logical stream multiplexed over a single shared TCP connection — you can have dozens of channels doing unrelated publishing/consuming/queue-management work over one connection, each with its own AMQP method IDs so RabbitMQ can tell their frames apart."
+          ],
+          diagram: {
+            type: "compare",
+            columns: [
+              { title: "Connection", points: ["A real TCP socket to the broker", "Established via the AMQP protocol (e.g. amqp://host:5672)", "Expensive to open/close", "One per application/service instance is typical"] },
+              { title: "Channel", points: ["A virtual connection multiplexed inside one TCP connection", "Cheap to open — many per connection is normal", "Used for publishing, consuming, and queue/exchange management", "NOT thread-safe — don't share one channel across threads"] }
+            ]
+          },
+          tricks: [
+            "A channel is not thread-safe — sharing a single channel across multiple threads for concurrent publishing is a classic production bug (interleaved frames corrupt the channel's state). The standard fix is one channel per thread, or a channel pool.",
+            "If you're opening a new Connection per request/message instead of reusing one long-lived connection with per-operation channels, that's a strong signal of a design mistake — say so unprompted if asked to review such code."
+          ]
+        }
+      },
+      { id: "sd-41", t: "Virtual Hosts (vHosts) — logical isolation", d: "Easy",
+        desc: "Think of a vHost the way you'd think of a database inside a single DBMS instance — its own exchanges, queues, and permissions, isolated from every other vHost on the same broker.",
+        notes: {
+          explain: [
+            "A single RabbitMQ broker can host multiple vHosts, each with a completely separate namespace of exchanges, queues, bindings, and user permissions. The default vHost is `/`. This is the standard mechanism for multi-tenancy (one broker, many isolated tenants) or environment separation (`/dev`, `/staging`, `/prod` all on one cluster) without running separate broker clusters for each."
+          ],
+          tricks: ["A vHost is an authorization/namespace boundary, not a performance-isolation one — all vHosts on a broker still share the same underlying hardware/Erlang VM resources, so noisy-neighbor problems across vHosts are still possible even though the namespaces are fully separate."]
+        }
+      },
+      { id: "sd-42", t: "Exchange types: Direct, Topic, Fanout, Headers", d: "Hard",
+        desc: "The exchange type is what determines the routing algorithm — this is the single most-asked RabbitMQ interview topic, and each type answers a different question about how to match a message to queues.",
+        notes: {
+          explain: [
+            "Direct exchange: routes a message to a queue only if the message's routing key EXACTLY matches the queue's binding key — a message with key 'error' goes only to a queue bound with 'error'. Topic exchange: relaxes that to wildcard pattern matching on dot-separated routing keys — `*` matches exactly one word, `#` matches zero or more words, so a binding of `order.*.created` matches `order.us.created` but not `order.created` or `order.us.eu.created`. Fanout exchange: ignores the routing key entirely and broadcasts the message to every queue bound to it — the standard choice for pub/sub-style 'notify everyone' patterns. Headers exchange: ignores the routing key completely and matches on message header key/value pairs instead, using an `x-match` argument of `all` (every header must match) or `any` (at least one must match) — useful when routing decisions depend on more than one attribute at once."
+          ],
+          code: [{ lang: "java", caption: "The routing-key/binding-key relationship for direct vs topic — the part people get wrong under pressure", src:
+`// Direct exchange — exact match only
+channel.bindQueue("errorQueue", "logs_direct", "error");
+// A message published with routing key "error" -> delivered.
+// A message published with routing key "error.db" -> NOT delivered (not exact).
+
+// Topic exchange — wildcard matching on dot-separated segments
+channel.bindQueue("usOrdersQueue", "orders_topic", "order.us.*");
+// "order.us.created"  -> matches (* = exactly one word)
+// "order.us.eu.created" -> does NOT match *, but WOULD match "order.us.#"
+// "order.created"      -> does NOT match (missing the "us" segment)`}],
+          diagram: {
+            type: "compare",
+            columns: [
+              { title: "Direct", points: ["Exact routing-key match", "Simple point-to-point-style routing", "e.g. route by log level: 'error', 'info'"] },
+              { title: "Topic", points: ["Wildcard match: * = one word, # = zero-or-more", "Pattern-based routing on structured keys", "e.g. 'order.us.*' , 'order.#'"] }
+            ]
+          },
+          tricks: [
+            "Fanout ignores the routing key completely — binding a fanout exchange with a specific routing key is a no-op that confuses people reading the code later; don't pass a meaningful key to a fanout binding.",
+            "Headers exchanges are rarely used in practice compared to the other three, but interviewers ask about them specifically to see if you know `x-match: all` vs `x-match: any` — all headers must match vs at least one, respectively.",
+            "A strong answer to 'which exchange type would you use for X' always ties the choice back to the actual routing requirement: one-to-one or you-know-the-exact-key → direct; hierarchical/pattern-based → topic; broadcast-to-everyone → fanout; multi-attribute routing → headers."
+          ]
+        }
+      },
+      { id: "sd-43", t: "Bindings — the rule connecting exchange to queue", d: "Medium",
+        desc: "A binding is what actually makes an exchange able to route anything — without at least one binding, an exchange just drops every message it receives.",
+        notes: {
+          explain: [
+            "A binding is a rule, created explicitly by the application (or an admin), that connects a specific exchange to a specific queue, optionally with a binding key (for direct/topic) or header-match arguments (for headers exchanges). One exchange can have bindings to many queues (fanning a message out to several places), and one queue can be bound to many exchanges (collecting messages from several sources into one place) — bindings form a many-to-many graph, not a strict tree."
+          ],
+          code: [{ lang: "java", caption: "One exchange, two bindings with different routing keys — a common fan-out-by-key pattern", src:
+`channel.bindQueue("inventoryQueue", "order_events", "order.created");
+channel.bindQueue("emailQueue", "order_events", "order.created");
+// A single publish to "order_events" with routing key "order.created"
+// is delivered to BOTH queues — bindings are not mutually exclusive.`}],
+          tricks: ["The single most common RabbitMQ debugging trap: 'I published a message and it just disappeared.' Nine times out of ten, the cause is a missing or misconfigured binding — always check bindings first, before suspecting the consumer or the network."]
+        }
+      },
+      { id: "sd-44", t: "Message anatomy: payload + properties", d: "Easy",
+        desc: "A message is a payload (opaque bytes to RabbitMQ) plus properties — contentType, deliveryMode, and custom headers — that both your application and RabbitMQ itself can act on.",
+        notes: {
+          code: [{ lang: "json", caption: "deliveryMode 2 = persistent (survives a broker restart, if the queue is ALSO durable); 1 = transient", src:
+`{
+  "body": "{ \\"orderId\\": 123 }",
+  "properties": {
+    "contentType": "application/json",
+    "deliveryMode": 2,
+    "headers": { "region": "india" }
+  }
+}`}],
+          tricks: ["`deliveryMode: 2` alone does NOT guarantee a message survives a broker restart — the queue it lands in must also be declared `durable: true`. Durability requires both halves; either one alone is not enough, and this exact gap is a favorite interview trap.", "Custom headers (like `region` above) are exactly what a Headers exchange (sd-42) matches on — they're not just for application-level metadata."]
+        }
+      },
+      { id: "sd-45", t: "Queue properties: durable, exclusive, auto-delete, TTL, DLX, lazy mode", d: "Medium",
+        desc: "Every queue is declared with a small set of properties that control its durability, ownership, and memory behavior — knowing this table cold is table stakes for a RabbitMQ interview.",
+        notes: {
+          code: [{ lang: "java", caption: "A queue declaration touching most of the properties at once", src:
+`await channel.assertQueue("orderQueue", {
+    durable: true,      // survives broker restart (paired with persistent messages)
+    exclusive: false,   // false = usable by more than one connection
+    autoDelete: false,  // false = queue survives even with zero consumers
+    arguments: {
+        "x-message-ttl": 30000,               // messages expire after 30s if unconsumed
+        "x-dead-letter-exchange": "dlx",       // expired/rejected messages go here
+    }
+});`}],
+          diagram: {
+            type: "tree",
+            root: "Queue properties",
+            children: [
+              { label: "durable — survives broker restart (needs persistent messages too)" },
+              { label: "exclusive — usable by only the declaring connection; auto-deletes when it closes" },
+              { label: "auto-delete — deleted once its last consumer disconnects" },
+              { label: "TTL (x-message-ttl) — messages expire after N ms" },
+              { label: "DLX (x-dead-letter-exchange) — where rejected/expired messages get routed" },
+              { label: "lazy mode (x-queue-mode) — stores messages on disk immediately to save RAM" }
+            ]
+          },
+          tricks: ["`exclusive: true` is easy to confuse with `durable` — exclusive is about connection ownership (only the declaring connection can use it, and it's deleted when that connection closes), completely unrelated to surviving a restart."]
+        }
+      },
+      { id: "sd-46", t: "Queue behavior types: Priority, DLQ, Lazy, TTL, Single Active Consumer, Stream", d: "Hard",
+        desc: "RabbitMQ doesn't have named queue 'types' the way it has named exchange types — special behavior comes entirely from the arguments you pass when declaring the queue.",
+        notes: {
+          explain: [
+            "This is a subtle but important distinction from exchanges: a Direct/Topic/Fanout/Headers exchange really is a different type, chosen at creation time. A queue, by contrast, is always just 'a queue' — what looks like a 'priority queue' or 'TTL queue' is actually a completely standard queue declared with a specific argument (`x-max-priority`, `x-message-ttl`, etc.) that changes its behavior. Recognizing this saves you from a wrong answer if asked 'what are the queue types in RabbitMQ.'"
+          ],
+          diagram: {
+            type: "tree",
+            root: "Special queue behaviors (all just arguments on assertQueue)",
+            children: [
+              { label: "Priority Queue — x-max-priority: N, higher-priority messages jump the line" },
+              { label: "Dead Letter Queue — x-dead-letter-exchange routes failed/expired/rejected messages here" },
+              { label: "Lazy Queue — x-queue-mode: 'lazy', stores to disk immediately to save RAM, slightly slower" },
+              { label: "TTL Queue — x-message-ttl: N, messages auto-expire after N ms" },
+              { label: "Single Active Consumer — x-single-active-consumer: true, only one consumer processes at a time (order-preserving); a backup takes over if it disconnects" },
+              { label: "Stream Queue — append-only log with offset-based replay, RabbitMQ's answer to Kafka-style semantics" }
+            ]
+          },
+          code: [{ lang: "java", caption: "Priority queue setup + a high-priority publish", src:
+`await channel.assertQueue("priorityQueue", { arguments: { "x-max-priority": 10 } });
+channel.sendToQueue("priorityQueue", Buffer.from("Urgent task"), { priority: 8 });
+// Delivered ahead of already-queued lower-priority messages, even though it arrived later.`}],
+          tricks: [
+            "Single Active Consumer is the direct answer to 'how do you get strict in-order processing with RabbitMQ while still having a hot standby for failover' — most people only know about competing consumers (parallel, unordered) or a single consumer with no failover.",
+            "The Stream Queue type is the newest of these and worth naming specifically if a comparison to Kafka comes up — it's RabbitMQ's own attempt at a replayable, offset-addressable log, closing the exact gap sd-9's Kafka-vs-broker comparison describes."
+          ]
+        }
+      },
+      { id: "sd-47", t: "Consumer acknowledgements: ack, nack, and requeue semantics", d: "Medium",
+        desc: "Manual acknowledgement (recommended) vs. auto-ack (less reliable) is the whole game for not silently losing messages when a consumer crashes mid-processing.",
+        notes: {
+          explain: [
+            "With auto-ack, RabbitMQ considers a message successfully delivered — and removes it — the instant it hands the message to the consumer's TCP socket, before the consumer has done any actual work. If the consumer then crashes while processing, that message is gone forever with no way to know it was ever lost. With manual acknowledgement, RabbitMQ keeps the message in an 'unacked' state tied to the consumer's channel until the consumer explicitly acks it after successfully finishing the work; if the consumer's connection/channel closes before that ack arrives, RabbitMQ automatically requeues the message for delivery to another consumer."
+          ],
+          code: [{ lang: "java", caption: "Manual ack after successful processing — the safe default", src:
+`channel.consume("orderQueue", (msg) => {
+    const order = JSON.parse(msg.content.toString());
+    console.log("Processing order:", order.orderId);
+    // ... do the actual work ...
+    channel.ack(msg);   // only now does RabbitMQ consider it safely delivered
+});`}],
+          diagram: {
+            type: "flow",
+            caption: "If the consumer crashes anywhere before the ack, RabbitMQ detects the closed channel and automatically requeues the message — no message is lost, though it may be processed twice (at-least-once, not exactly-once).",
+            steps: [
+              { label: "RabbitMQ delivers", note: "message sent to consumer" },
+              { label: "Consumer processes", note: "the actual work happens here", arrowLabel: "→" },
+              { label: "channel.ack(msg)", note: "explicit success signal", arrowLabel: "→" },
+              { label: "RabbitMQ removes", note: "message permanently deleted", arrowLabel: "→" }
+            ]
+          },
+          tricks: [
+            "`channel.nack(msg, false, true)` requeues the message; `channel.nack(msg, false, false)` drops it (or routes it to a DLQ if one is configured) — the third argument is the one people mix up under pressure.",
+            "`reject()` is the single-message-only sibling of `nack()` — `nack` additionally supports a `multiple` flag to negatively-acknowledge a whole batch of unacked messages at once, which `reject` cannot do.",
+            "Manual ack guarantees at-least-once delivery, not exactly-once — a consumer can still process a message successfully and crash right before sending the ack, causing a harmless-looking duplicate redelivery. Idempotent consumers are still the caller's responsibility, exactly as with Kafka."
+          ]
+        }
+      },
+      { id: "sd-48", t: "Publisher confirms — the producer-side half of reliability", d: "Medium",
+        desc: "Consumer ack (sd-47) only protects the delivery-to-consumer half of the journey — publisher confirms are what tell the PRODUCER that RabbitMQ actually received and persisted the message in the first place.",
+        notes: {
+          explain: [
+            "Without publisher confirms, a producer calls publish() and moves on with no idea whether the message actually reached the broker, or was lost to a network blip or a broker restart mid-flight. Putting a channel into confirm mode makes RabbitMQ send an explicit ack back to the producer once the message is safely queued (and written to disk, if the queue is durable and the message persistent) — giving the producer a real signal to retry on, instead of just hoping the publish succeeded."
+          ],
+          tricks: ["A complete reliability story needs BOTH halves: publisher confirms (did the broker actually get it?) and consumer acks (did the consumer actually finish processing it?). An answer that only mentions one side is the classic tell of someone who's used RabbitMQ but hasn't had to reason about failure modes in production."]
+        }
+      },
+      { id: "sd-49", t: "RabbitMQ vs. Kafka — the deeper interview framing", d: "Medium",
+        desc: "Beyond sd-9's durability/replay framing, the sharper way to contrast them is 'smart broker, dumb consumer' (RabbitMQ) vs. 'dumb broker, smart consumer' (Kafka).",
+        notes: {
+          explain: [
+            "RabbitMQ pushes routing intelligence into the broker itself — exchanges, binding patterns, priority, per-message TTL, all evaluated broker-side before a consumer ever sees a message, which is powerful but adds per-message CPU work on the broker and caps how far a single broker scales. Kafka pushes that intelligence out to the edges: the broker is a dumb, extremely fast append-only log with almost no per-message routing logic, and all the smarts (which partition, what offset, how to interpret the stream) live in the producer/consumer client libraries — which is exactly why Kafka comfortably handles orders of magnitude more raw throughput than RabbitMQ, at the cost of RabbitMQ's much richer built-in routing."
+          ],
+          tricks: ["When asked to choose between them, lead with the workload shape, not a feature checklist: complex routing/priority/low-latency task distribution at moderate volume → RabbitMQ; massive-throughput event streaming with multiple independent replayable consumers → Kafka. Naming the 'smart broker vs. smart client' framing explicitly is a strong signal you understand WHY the throughput difference exists, not just that it exists."]
+        }
+      },
+      { id: "sd-50", t: "Rapid-fire RabbitMQ interview questions", d: "Medium",
+        desc: "The questions that come up often enough to be worth having crisp, one-breath answers ready for.",
+        notes: {
+          explain: ["These are phrased exactly as they tend to get asked — practice saying the answers out loud, not just recognizing them as true."],
+          tricks: [
+            "Q: What happens if you publish a message that matches no binding? A: It's silently dropped by default — set the `mandatory` flag on publish to have it returned to the producer instead.",
+            "Q: Why use channels instead of just opening more connections? A: TCP connections are expensive to open/close; channels are cheap virtual streams multiplexed over one shared connection.",
+            "Q: Direct vs. Topic exchange, in one sentence? A: Direct requires an exact routing-key match; Topic allows wildcard patterns (`*` = one word, `#` = zero-or-more words) in the binding key.",
+            "Q: How do you guarantee a message survives a broker restart? A: The queue must be `durable: true` AND the message must be published with `deliveryMode: 2` (persistent) — either alone is not sufficient.",
+            "Q: What's the difference between `nack` and `reject`? A: `reject` only ever affects one message; `nack` can also act on a whole batch of unacked messages at once via its `multiple` flag.",
+            "Q: What happens if a consumer crashes before acking a message? A: RabbitMQ detects the closed channel/connection and automatically requeues the unacked message for another consumer — at-least-once, not exactly-once.",
+            "Q: What is a Dead Letter Exchange for? A: Capturing messages that are rejected, expire via TTL, or exceed a queue length/size limit, routing them somewhere inspectable instead of losing them silently.",
+            "Q: Does RabbitMQ have a 'priority queue' type? A: No — it's a standard queue declared with the `x-max-priority` argument; RabbitMQ has exchange types, not queue types."
+          ]
+        }
+      }
+    ]},
     { name: "Design Case Studies (practice out loud)", items: [
       { id: "sd-20", t: "Design a distributed rate limiter", d: "Medium",
         desc: "The single-node algorithm (sd-10) is easy — the hard part is making the counter correct and fast when many gateway instances share one limit.",
