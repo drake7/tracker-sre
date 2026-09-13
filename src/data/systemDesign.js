@@ -253,6 +253,60 @@ String backendFor(String key) {
             "'Exactly-once' end-to-end doesn't really exist without idempotency — what you're actually building is at-least-once delivery + idempotent processing, which nets out to effectively-once. Say this distinction explicitly; it mirrors the sd-19 discussion.",
             "The dedup check-and-store must be atomic (conditional put / unique constraint), not a separate read-then-write — otherwise two concurrent retries race each other, both pass the check before either commits, and the duplicate gets processed anyway."
           ]
+        }},
+      { id: "sd-51", t: "Authentication & authorization at scale (OAuth2/OIDC, JWT vs opaque tokens)", d: "Medium",
+        desc: "Where identity gets checked shapes your whole trust model — and JWT vs opaque tokens trades revocability for a network hop on every request.",
+        notes: {
+          explain: [
+            "OAuth2 is a delegated-authorization framework ('let this app act on my behalf, with this scope') — OIDC is an identity layer built on top of it that actually proves who the user is. Interviewers listen for the distinction: authentication (who are you — happens once, at login, producing a token) is different from authorization (what can you do — checked on every request), and centralizing authz at a gateway (sd-10) is what keeps individual services from each reimplementing it.",
+            "JWT vs opaque token is the concrete design decision. A JWT is self-contained and signed — a gateway verifies it locally via signature check, zero network call, which scales horizontally with no shared state — but revoking one compromised JWT before its natural expiry is hard: either maintain a deny-list (which defeats the whole no-lookup benefit) or accept the exposure window and keep expiry short. An opaque token is a random string looked up in a shared store (Redis) on every request — trivially revocable (delete the row), no client-visible claims — at the cost of a network round-trip and a shared dependency on every authenticated request, the same tradeoff shape as stateful vs stateless services (sd-1)."
+          ],
+          diagram: { type: "compare",
+            columns: [
+              { title: "JWT (self-contained)", points: ["Verified locally via signature — no network call", "Scales horizontally, no shared state", "Hard to revoke before expiry", "Claims are visible to the holder (base64, not encrypted)"] },
+              { title: "Opaque token", points: ["Random string, looked up in a shared store per request", "Instantly revocable — delete the row", "Adds a network hop + shared dependency to every request", "No client-visible claims"] }
+            ]},
+          tricks: [
+            "Short-lived JWT access token + longer-lived opaque refresh token is the standard hybrid — fast local verification for most requests, with real revocation happening at refresh time and the exposure window bounded to the access token's short TTL.",
+            "Do coarse-grained authz (is this token valid, does this role allow this route) at the gateway; push fine-grained/resource-level authz (can THIS user edit THIS document) down to the owning service — the gateway usually lacks the domain context to make that call correctly."
+          ]
+        }},
+      { id: "sd-52", t: "Probabilistic data structures at scale (HyperLogLog, Count-Min Sketch, Bloom filters as a toolkit)", d: "Medium",
+        desc: "Three different 'exact tracking is too expensive' problems — membership, cardinality, frequency — and a different structure answers each one.",
+        notes: {
+          explain: [
+            "All three trade a small, tunable error rate for massive memory savings over an exact structure, and all three matter the moment a question moves from 'at a thousand' to 'at a billion events a day.' A Bloom filter answers 'have I seen this exact item before' (sd-36's crawler dedup) — a bit array plus k hash functions that can false-positive but never false-negatives, safe whenever a wrongly-skipped item is the only downside.",
+            "HyperLogLog answers a different question entirely — not 'have I seen this item' but 'how many DISTINCT items have I seen' (unique visitors today, distinct IPs hitting an endpoint) — estimating cardinality in a fixed ~12KB regardless of whether the true count is a thousand or a billion, and critically, HLLs are mergeable: union two shards' HLLs into one without re-scanning raw data, which is why Redis exposes PFADD/PFCOUNT/PFMERGE natively. Count-Min Sketch answers a third question — 'approximately how many times has this occurred' (trending hashtags, per-API-key request counts) — a small counter grid updated via multiple hash functions per event, never under-counting at the cost of a small, bounded over-count bias."
+          ],
+          diagram: { type: "tree", root: "Probabilistic toolkit — pick by the question being asked",
+            children: [
+              { label: "Bloom filter", children: [{ label: "Have I seen this exact item? False positives possible, never false negatives" }] },
+              { label: "HyperLogLog", children: [{ label: "How many DISTINCT items? Mergeable cardinality estimate in ~KBs" }] },
+              { label: "Count-Min Sketch", children: [{ label: "Approximately how many times has X occurred? Never under-counts" }] }
+            ]},
+          tricks: [
+            "Naming HyperLogLog specifically (not 'we'd sample it') is the strong answer to any 'count unique X at scale' question — PFADD/PFCOUNT/PFMERGE is a concrete, citable implementation, and mergeability is what shows you understand why it fits a sharded pipeline.",
+            "Don't reach for a probabilistic structure when the real cardinality fits in memory as an exact set — naming that boundary explicitly, instead of defaulting to 'use a Bloom filter' for everything, is what shows judgment rather than pattern-matching."
+          ]
+        }},
+      { id: "sd-53", t: "Distributed ID generation (Snowflake-style)", d: "Medium",
+        desc: "Every sharded system eventually needs globally unique, roughly time-sortable IDs minted with zero coordination on the hot path.",
+        notes: {
+          explain: [
+            "A single auto-incrementing DB counter doesn't survive sharding — there's no longer one database holding the canonical next value, and routing every mint through one coordinator reintroduces the exact bottleneck partitioning was meant to remove. The requirement is usually: unique across the whole fleet, roughly sortable by creation time (useful for pagination/range queries without a separate timestamp column), and mintable locally with zero coordination on the request path.",
+            "Snowflake's answer packs a 64-bit ID as [41 bits timestamp][10 bits worker ID][12 bits per-machine sequence number, reset each millisecond]. Timestamp-first makes IDs k-sortable even though no machine ever talks to another while minting. The worker ID is assigned once at startup (config, or a short-lived coordination step against ZooKeeper/etcd — the only coordination in the whole scheme, amortized over the machine's entire lifetime, not per-ID); the sequence number absorbs multiple IDs minted in the same millisecond on the same machine."
+          ],
+          diagram: { type: "flow", caption: "Each field is sized so no two machines can ever collide without ever talking to each other.",
+            steps: [
+              { label: "Timestamp (41 bits)", note: "ms since custom epoch — makes IDs k-sortable" },
+              { label: "Worker ID (10 bits)", note: "assigned once at startup, not per-ID", arrowLabel: "→" },
+              { label: "Sequence (12 bits)", note: "resets every ms, absorbs same-ms bursts", arrowLabel: "→" }
+            ]},
+          tricks: [
+            "The insight worth stating: the only coordination in the whole scheme is assigning a worker ID once at process startup — after that every machine mints IDs independently forever, a mathematical uniqueness guarantee rather than a runtime check.",
+            "Clock skew is the real production gotcha — if a machine's clock jumps backward (NTP correction), it can mint a timestamp it already used. The standard mitigation is detecting backward jumps and refusing to mint until the clock catches back up.",
+            "UUID v4 needs no coordination and no worker ID, but isn't sortable and is 128 bits — pick Snowflake-style IDs specifically when index locality or range-scan-by-recency matters, not as a default over UUIDs."
+          ]
         }}
     ]},
     { name: "Distributed Data & Streaming (deepen your existing edge)", items: [
@@ -751,7 +805,7 @@ channel.sendToQueue("priorityQueue", Buffer.from("Urgent task"), { priority: 8 }
           tricks: ["The concrete habit: write the one-sentence business-consequence version before writing the technical version, and practice starting with it — most engineers draft the technical explanation first and try to translate down, which is why the 'translated' version still sounds like an engineer talking."]
         }}
     ]},
-    { name: "MANG Interview Case Studies", items: [
+    { name: "MAANG Interview Case Studies", items: [
       { id: "sd-29", t: "Design a News Feed (Meta/Instagram-style)", d: "Hard",
         desc: "The canonical Meta system design question — fan-out on write vs. fan-out on read is the whole game.",
         notes: {
@@ -878,12 +932,372 @@ channel.sendToQueue("priorityQueue", Buffer.from("Urgent task"), { priority: 8 }
             "Naming erasure coding (not just replication) as the storage-efficient path to high durability signals real depth — many candidates only get as far as 'store multiple copies in different data centers,' which is correct but far more expensive than what large-scale object stores actually do, especially for cold/infrequently-accessed data."
           ]
         }},
-      { id: "sd-38", t: "MANG interview format & rubric — what evaluators actually score", d: "Easy",
+      { id: "sd-54", t: "Design a full-text search engine (Google/Elasticsearch-style)", d: "Hard",
+        desc: "Beyond autocomplete (sd-33): matching free text against billions of documents and ranking results — the inverted index is the one structure this whole field is built on.",
+        notes: {
+          explain: [
+            "The core data structure is an inverted index: for every distinct term, a sorted postings list of every document ID containing it, plus enough metadata (term frequency, position) to score relevance later. A multi-term query becomes an intersection (AND) or union (OR) of postings lists — search stays fast over billions of documents because you're merging pre-sorted ID lists, never scanning document text at query time. Building the index is an offline/streaming pipeline (ingest → tokenize → normalize → write into postings lists), sharded by document range or hash so indexing and query fan-out both parallelize.",
+            "Ranking is the second half. Classic relevance scoring (TF-IDF or BM25) weighs a term higher when it's frequent in this document but rare across the corpus, run over the candidate set the postings intersection returns; production systems layer a second-stage learned ranker (click-through data, freshness, authority) on top — the same 'cheap candidate generation, expensive precise scoring' shape as sd-22's fraud pipeline and sd-29's feed ranking. At query time a query is scatter-gathered to every shard, each returns its local top-K, and a merge step produces the global top-K — so a single slow shard determines the whole query's tail latency, sd-6's fan-out amplification applied directly to search."
+          ],
+          diagram: { type: "flow", caption: "Scatter-gather: each shard scores its own postings matches locally; a merge step combines shard-local top-K into one global ranked result.",
+            steps: [
+              { label: "Query", note: "tokenize + normalize" },
+              { label: "Broadcast to shards", note: "each intersects local postings lists", arrowLabel: "→" },
+              { label: "Shard-local top-K", note: "BM25 / TF-IDF scoring", arrowLabel: "→" },
+              { label: "Merge", note: "global top-K", arrowLabel: "→" }
+            ]},
+          tricks: [
+            "Say 'inverted index,' not 'database with a text column' — a LIKE '%term%' scan is exactly the linear scan an inverted index exists to avoid.",
+            "Know BM25/TF-IDF well enough to explain the shape: raw term frequency alone over-favors long/repetitive documents, and inverse document frequency is what down-weights common words like 'the' — naming why the formula looks the way it does beats naming the formula.",
+            "Name the scatter-gather tail-latency cost unprompted — query latency is bound by the slowest shard, the same fan-out amplification as sd-6; a timeout-and-return-partial-results strategy is the standard mitigation."
+          ]
+        }},
+      { id: "sd-55", t: "Design a real-time analytics/counting pipeline (e.g. count ad clicks/impressions)", d: "Hard",
+        desc: "Tests the same streaming-aggregation muscle as fraud detection (sd-22), but the design center is exact-vs-approximate counting under extreme write volume.",
+        notes: {
+          explain: [
+            "The tension: a high-volume event stream (clicks, impressions) needs aggregation at multiple granularities (per ad, per campaign, per minute/hour/day) for both a near-real-time dashboard (seconds-to-minutes freshness, approximate is fine) and a billing-accurate report (must be exact, hours of latency is fine) — one system rarely serves both well, so the standard answer is two paths over the same ingested stream, not one.",
+            "The streaming path (Kafka → Flink, direct extension of sd-14/sd-15) does windowed aggregation keyed by ad ID and writes rolling counts to a fast store (Redis, a time-series DB) for the dashboard, using approximate structures (sd-52's Count-Min Sketch, or plain pre-aggregated counters) where exactness isn't worth the cost. The batch path replays the same raw events, from durable Kafka retention or a data-lake landing, through an exact reconciliation job on a delay, producing the billing-of-record numbers. The design has to name explicitly why these are two pipelines: the dashboard is allowed to be off by a few percent for a few minutes, the billing number is never allowed to be wrong — one pipeline trying to satisfy both ends up either too slow for the dashboard or not trusted for money."
+          ],
+          diagram: { type: "compare",
+            columns: [
+              { title: "Real-time path", points: ["Kafka → Flink windowed aggregation", "Approximate OK (Count-Min Sketch / pre-agg counters)", "Freshness: seconds–minutes", "Serves live dashboards"] },
+              { title: "Batch reconciliation path", points: ["Replay from durable log / data lake", "Exact counts required", "Freshness: hours, runs on a delay", "Serves billing / source-of-truth reports"] }
+            ]},
+          tricks: [
+            "State why one pipeline can't serve both needs: fast+approximate and exact+delay-tolerant are in tension, and forcing one system to do both usually makes the exact path fight for speed or the fast path get distrusted for money.",
+            "Idempotency and exactly-once (sd-19) matter more here than almost anywhere — a double-counted click either loses revenue or overcharges an advertiser, so dedup keys on ingestion are a hard requirement, not a nice-to-have.",
+            "If asked about a late-arriving event (a mobile client buffering clicks offline for two hours), name watermarks — Flink's mechanism for deciding how long to wait for late data before closing a window — as the concrete answer, not 'we'd handle it.'"
+          ]
+        }},
+      { id: "sd-38", t: "MAANG interview format & rubric — what evaluators actually score", d: "Easy",
         desc: "Requirements clarification, high-level design before deep-diving, explicit tradeoff articulation, and driving the conversation yourself instead of waiting to be asked — the process matters as much as the final diagram.",
         notes: {
           tricks: [
             "Spend the first few minutes on clarifying questions (scale, read:write ratio, consistency requirements, latency budget) before drawing anything — jumping straight to a diagram without scoping is the single most common way candidates lose points.",
             "Narrate tradeoffs out loud even when not asked ('I'm choosing eventual consistency here because...') — silent correct answers score worse than reasoned answers with minor imperfections, because the interviewer is evaluating your judgment, not just your final diagram."
+          ]
+        }}
+    ]},
+    { name: "More Classic MAANG Questions", items: [
+      { id: "sd-56", t: "Design a Parking Garage/Lot System", d: "Medium",
+        desc: "A classic OOD-meets-system-design question — the interesting parts are atomic spot allocation across concurrent gates and O(1) availability lookups, not the class diagram.",
+        notes: {
+          explain: [
+            "The OOD half is usually assumed easy: Vehicle subtypes (car/motorcycle/bus) needing different spot sizes, a ParkingSpot with a size/status, a ParkingFloor grouping spots, and a Ticket recording entry time and spot assignment. The system-design half is where interviewers actually probe: with multiple entry gates operating concurrently, two cars arriving at the same instant must never be assigned the same spot — spot assignment has to be an atomic reservation (a conditional update or a per-spot lock), not a read-then-write, exactly the same race the URL shortener's ID-range allocation guards against.",
+            "The other real design question is spot-finding at scale: for thousands of spots across many floors, scanning every spot for 'first available' doesn't scale — maintain a live count of free spots per size-class per floor (incremented/decremented atomically on entry/exit) so a gate display can show 'floor 3: 12 compact spots free' in O(1), and only search within a floor once a car is directed there. Pricing (flat, hourly, dynamic/surge when nearly full) is a smaller follow-up worth naming as a pluggable strategy rather than hardcoded logic."
+          ],
+          diagram: { type: "flow",
+            steps: [
+              { label: "Entry gate", note: "vehicle arrives" },
+              { label: "Find spot", note: "by size, nearest available floor", arrowLabel: "→" },
+              { label: "Atomic reserve", note: "+ issue ticket", arrowLabel: "→" },
+              { label: "Exit: compute fee", note: "by duration/strategy", arrowLabel: "→" },
+              { label: "Atomic release", note: "spot back to available", arrowLabel: "→" }
+            ]},
+          tricks: [
+            "Say 'atomic reservation, not read-then-write' explicitly for spot assignment across concurrent gates — the same TOCTOU race as the URL shortener's ID range and a ticket-booking seat hold, and naming the pattern by name signals you see the recurring shape.",
+            "A live per-floor, per-size free-spot counter (not scanning spots) is what makes the gate's 'spots available' display and routing decision O(1) instead of O(spots) — worth stating unprompted."
+          ]
+        }},
+      { id: "sd-57", t: "Design GitHub (version control + code review at scale)", d: "Hard",
+        desc: "Less about reinventing Git's internals and more about how a hosting service serves millions of repos' worth of Git objects, plus the review/CI workflow layered on top.",
+        notes: {
+          explain: [
+            "Git itself is already a distributed, content-addressed object store (commits/trees/blobs keyed by SHA) — the design question is what a HOSTING service adds: authentication/authorization per repo, a web UI and API over the object store, and horizontal scaling of storage for millions of repositories with wildly uneven size and access frequency. Git operations (clone/push/pull) are served by a fleet of Git-protocol servers backed by a sharded/replicated storage layer (each repo lives on a shard chosen by consistent hashing, sd-7, so the service grows shards without a full reshuffle), while the web/API layer is a separate stateless tier reading the same underlying data.",
+            "Pull requests, review comments, and CI status are a metadata layer distinct from the Git objects themselves — a relational/document store tracking PR state and review threads, with a webhook/event system (a queue, sd-9) notifying CI runners when a push happens. CI is its own big fan-out problem: a push can trigger dozens of downstream jobs, each needing an isolated, ephemeral compute environment — the design center there is job queuing and fair scheduling across many repos' concurrent CI demand, not the Git storage question at all."
+          ],
+          diagram: { type: "compare",
+            columns: [
+              { title: "Git storage layer", points: ["Content-addressed objects (commits/trees/blobs)", "Sharded by repo via consistent hashing", "Served by Git-protocol servers (clone/push/pull)", "Read-heavy for popular repos"] },
+              { title: "Platform layer", points: ["PR/review state in a relational/doc store", "Webhooks/queue trigger CI on push", "CI runners are ephemeral, isolated per job", "Fair scheduling across many repos' concurrent demand"] }
+            ]},
+          tricks: [
+            "Separate 'the Git object store' from 'the platform metadata' explicitly — conflating them is the wrong direction; they have completely different access patterns and consistency needs.",
+            "CI fan-out is its own queueing/scheduling problem, not a storage problem — naming fair-scheduling-across-tenants (one repo's huge CI burst shouldn't starve everyone else's) shows you're not just describing Git."
+          ]
+        }},
+      { id: "sd-58", t: "Design Jira (ticketing / workflow state machine)", d: "Medium",
+        desc: "The core object is a ticket moving through a configurable workflow state machine — the interesting problem is configurable fields and workflows per project without a schema migration for every customization.",
+        notes: {
+          explain: [
+            "A ticket has core fields (title, assignee, status) plus per-project-configurable custom fields and a workflow (an explicit state machine: allowed transitions like Open → In Progress → Done, which can differ per project/issue-type). Modeling this rigidly doesn't scale across thousands of differently-configured projects — the standard approach is an EAV side table or a JSON/document column for custom fields, trading some query performance and type safety for schema flexibility, plus a separate WorkflowDefinition that a ticket's current state is validated against on every transition attempt.",
+            "Search/filtering (JQL-style queries across arbitrary custom fields) is the other hard part: a general relational query across a sparse EAV table is slow, so at scale this gets denormalized into a search index (sd-54) kept in sync via CDC (sd-18) from the primary store, which remains the source of truth for writes. Activity history (every field change, every comment) is an append-only event log per ticket — driving the audit trail and able to reconstruct ticket state, the same event-sourcing shape as a saga's compensating log (sd-17)."
+          ],
+          diagram: { type: "tree", root: "Ticket platform building blocks",
+            children: [
+              { label: "Core fields + EAV/JSON custom fields", children: [{ label: "Flexible schema without per-customer migrations" }] },
+              { label: "Workflow state machine", children: [{ label: "Transitions validated against a per-project WorkflowDefinition" }] },
+              { label: "Search index (via CDC)", children: [{ label: "Flexible filtering across sparse custom fields" }] },
+              { label: "Append-only activity log", children: [{ label: "Audit trail; can reconstruct current state" }] }
+            ]},
+          tricks: [
+            "Naming EAV/JSON-for-custom-fields as the answer to 'thousands of projects each want different fields' is the concrete signal — a fixed relational schema is the wrong instinct here.",
+            "The workflow is data (a per-project state machine definition), not code — hardcoding transition logic per project doesn't scale to a self-serve configurable product."
+          ]
+        }},
+      { id: "sd-59", t: "Design Dropbox/Google Drive (file sync & storage)", d: "Hard",
+        desc: "Distinct from S3 (sd-37): the hard part here is sync and conflict resolution across multiple devices watching the same files, not just durable storage.",
+        notes: {
+          explain: [
+            "Files are chunked into fixed-size, content-hashed blocks; only changed blocks need re-upload on an edit (the same content-addressing idea as Git), and the bytes live in a blob store much like sd-37's object storage. The harder half is the sync protocol: each client watches its local filesystem, and on detecting a change, diffs against the last-known-synced state to find changed blocks, uploads them, and updates a metadata service mapping file paths to block lists and version numbers.",
+            "Conflict handling is the core design tension: two devices editing the same file while offline both produce edits against the same base version. The standard approach is optimistic concurrency via a version number (or vector clock) per file — a push with a stale base version is rejected, and the client keeps the losing version as a 'conflicted copy' file rather than attempting an automatic merge, which is only tractable for structured formats, not arbitrary binary files. Real-time notification of remote changes uses a long-lived push channel per client, not polling, so other devices sync quickly without hammering the metadata service."
+          ],
+          diagram: { type: "compare",
+            columns: [
+              { title: "Block sync", points: ["Files chunked into content-hashed blocks", "Only changed blocks re-uploaded", "Blob storage backend (S3-style, sd-37)", "Efficient for small edits to large files"] },
+              { title: "Conflict handling", points: ["Version number/vector clock per file", "Stale-base push rejected, not silently overwritten", "Losing edit kept as a 'conflicted copy'", "No automatic merge for arbitrary binary files"] }
+            ]},
+          tricks: [
+            "Say explicitly why automatic merging isn't attempted for arbitrary files (unlike sd-35's OT/CRDT for structured documents) — without semantic understanding of the format, a 'merge' can silently corrupt it.",
+            "Chunking + content-hashing means renaming or moving a huge unchanged file costs almost nothing to re-sync (same blocks, new metadata) — a strong, concrete detail beyond 'we sync files.'"
+          ]
+        }},
+      { id: "sd-60", t: "Design a Ticket-Booking System (Ticketmaster/BookMyShow)", d: "Hard",
+        desc: "Extremely similar shape to e-commerce checkout (sd-31), but sharper: thousands of people can be looking at the exact same 200 seats for a popular show at the same moment.",
+        notes: {
+          explain: [
+            "The core tension is identical to inventory oversell (sd-31) but concentrated: a popular on-sale event creates a thundering herd (sd-8) of concurrent requests for the same small pool of seats. The standard pattern is a short-lived seat hold — selecting seats moves them to a 'held' state (TTL, typically 5-10 minutes) visible to no one else, confirmed on successful payment or released back to available on timeout/payment failure — the same reserve-then-confirm-or-release shape as checkout's inventory hold, applied per-seat instead of per-SKU-count.",
+            "Seat-level locking at high contention needs to be fast and atomic — a Redis-backed hold (a conditional set with a TTL per seat ID) is the common answer rather than a row-level DB lock, since DB locks held across a slow user checkout flow would serialize and stall everyone else looking at the same section. A virtual waiting room in front of checkout for the highest-demand on-sales (rate-limiting entry into the booking flow itself, sd-10) is worth naming as the practical mitigation real ticketing sites use, rather than trying to make the seat-hold step itself infinitely scalable."
+          ],
+          diagram: { type: "flow",
+            steps: [
+              { label: "Select seats", note: "" },
+              { label: "Atomic hold", note: "Redis, short TTL", arrowLabel: "→" },
+              { label: "Payment", note: "", arrowLabel: "→" },
+              { label: "Confirm or release", note: "success → confirmed; timeout/fail → back to available", arrowLabel: "→" }
+            ]},
+          tricks: [
+            "Redis-backed per-seat holds with a TTL, not a DB row lock held across the checkout flow, is the concrete answer for contention at this scale.",
+            "A virtual waiting room ahead of checkout for the highest-demand on-sales is a real, citable mitigation — naming it shows awareness beyond the seat-hold mechanism alone."
+          ]
+        }},
+      { id: "sd-61", t: "Design an Elevator System", d: "Medium",
+        desc: "Primarily an OOD/state-machine question — the system-design angle is scheduling: which elevator answers which call, and how that changes across a bank of elevators.",
+        notes: {
+          explain: [
+            "Each elevator is a state machine (idle, moving up, moving down, doors open) with a request queue; the OOD backbone is an Elevator (current floor, direction, target floors) and a Dispatcher receiving hall calls (floor + direction) and car calls (button pressed inside). The classic scheduling algorithm (SCAN/LOOK, the same shape as disk-arm scheduling) has each elevator continue in its current direction servicing all requests along the way before reversing, rather than serving requests in arrival order — this avoids starvation and minimizes total travel.",
+            "For a bank of multiple elevators, the dispatcher's job is choosing which car answers a new hall call — the standard heuristic assigns the call to the nearest elevator already moving toward that floor in the matching direction, or the nearest idle elevator otherwise, minimizing wait time across the whole bank rather than optimizing any single car in isolation. At scale (a busy office tower at 9am) this becomes a real-time assignment optimization problem — a good answer treats it as minimizing aggregate wait time, not routing each request greedily to whichever car is momentarily closest."
+          ],
+          diagram: { type: "tree", root: "Elevator dispatch decision",
+            children: [
+              { label: "Hall call arrives (floor + direction)" },
+              { label: "Elevator already moving toward it, same direction?", children: [{ label: "Assign it — minimal detour, in-pass" }] },
+              { label: "Otherwise", children: [{ label: "Assign nearest idle elevator" }] },
+              { label: "Bank-wide goal: minimize aggregate wait, not per-request greedy assignment" }
+            ]},
+          tricks: [
+            "Name SCAN/LOOK explicitly (servicing all requests in the current direction before reversing) — the detail that separates a real answer from 'it goes to whichever floor is called.'",
+            "Call out the failure mode of a naive 'send the closest elevator' rule that ignores current direction — sending one already moving away, only to reverse it, is worse than waiting for one already headed that way."
+          ]
+        }},
+      { id: "sd-62", t: "Design a Vending Machine", d: "Easy",
+        desc: "A small, self-contained state-machine question — asked to see if you model transitions and edge cases cleanly, not for its system-design depth.",
+        notes: {
+          explain: [
+            "The machine is a state machine: Idle → (coin inserted) → HasBalance → (selection, sufficient balance) → Dispensing → (item + change out) → Idle, with explicit edge transitions for insufficient balance (stay in HasBalance, prompt for more), out-of-stock selection (reject, refund or prompt reselect), and exact-change-unavailable (refund the full amount rather than dispense without correct change). The value of this question is entirely in enumerating those edge cases explicitly and modeling them as real states/transitions rather than ad hoc if-statements bolted onto a happy path.",
+            "Inventory and pricing are simple key-value lookups, not a distributed-systems problem at this scale — the one design-adjacent point worth making is that a single physical machine is inherently single-writer/single-reader, so none of the concurrency machinery from other case studies (locks, atomic reservations) is needed here, and saying so explicitly shows correct scoping rather than reflexively adding distributed-systems machinery everywhere."
+          ],
+          diagram: { type: "tree", root: "Vending machine state machine",
+            children: [
+              { label: "Idle", children: [{ label: "coin inserted → HasBalance" }] },
+              { label: "HasBalance", children: [{ label: "selection + sufficient balance → Dispensing" }, { label: "insufficient balance → stays, prompts more" }] },
+              { label: "Dispensing", children: [{ label: "item + change out → Idle" }, { label: "no exact change → full refund, Idle" }] }
+            ]},
+          tricks: [
+            "Exact-change-unavailable refunding the FULL amount (not dispensing without change, not a partial refund) is the edge case interviewers specifically listen for.",
+            "Explicitly noting this is single-writer/single-reader and needs none of the concurrency control from other design questions is itself a good answer — judgment about when NOT to reach for distributed-systems machinery."
+          ]
+        }},
+      { id: "sd-63", t: "Design Google Maps / Real-Time Routing", d: "Hard",
+        desc: "Distinct from ride-share dispatch (sd-34): the hard problem here is shortest-path routing over a continent-scale road graph with live traffic, not matching riders to drivers.",
+        notes: {
+          explain: [
+            "The road network is a graph (intersections as nodes, road segments as weighted edges, weight = travel time). Naive Dijkstra is far too slow at continent scale — production routers precompute structure offline (contraction hierarchies: iteratively 'shortcut' less-important nodes, so a live query skips over most of the graph and only routes through a small set of important roads) to answer shortest-path queries in milliseconds. Map data (roads, turn restrictions, speed limits) is mostly static and updates on a slow cadence, so it's distributed to regional routing servers as periodic snapshot rebuilds rather than needing real-time consistency.",
+            "Live traffic is the part that must be real-time: aggregating anonymized speed/position pings from phones into current speed estimates per road segment (a streaming aggregation pipeline, the same shape as sd-22's fraud pipeline but keyed by road segment instead of account), which adjusts edge weights for routing queries without re-running the expensive offline precomputation. ETA also has to account for the route's traffic changing during the trip, which is why apps recompute/re-rank routes periodically during navigation rather than committing to a single static ETA at request time."
+          ],
+          diagram: { type: "compare",
+            columns: [
+              { title: "Static (precomputed offline)", points: ["Road graph, turn restrictions, speed limits", "Contraction hierarchies precomputed for fast queries", "Rebuilt on a slow cadence", "Distributed to regional servers as snapshots"] },
+              { title: "Live (streaming)", points: ["Anonymized speed/position pings from devices", "Streaming aggregation → current speed per segment", "Adjusts edge weights, not the precomputed structure", "Routes/ETA re-ranked periodically during a trip"] }
+            ]},
+          tricks: [
+            "Naming contraction hierarchies (or at least 'offline-precomputed shortcuts') is what separates this from 'run Dijkstra' — naive shortest-path live over a continent-scale graph is the wrong answer.",
+            "Separate the static graph-structure problem from the live traffic-weighting problem explicitly — they update on completely different cadences via completely different pipelines."
+          ]
+        }},
+      { id: "sd-64", t: "Design Yelp / Nearby Places Search", d: "Medium",
+        desc: "Read-heavy geospatial search over mostly-static data — shares the geospatial toolkit with ride-share dispatch (sd-34) but without the real-time matching/dispatch problem.",
+        notes: {
+          explain: [
+            "The core query is 'businesses within X km, optionally filtered by category, sorted by rating/distance' — the same geospatial indexing choice as sd-34 (geohashing or a quadtree/R-tree) applies, but here the indexed data changes rarely compared to a driver's constantly-updating GPS position, so the index can be a slower-to-update, more heavily cached structure rather than one optimized for continuous high-frequency writes.",
+            "Because reads dominate so heavily, the standard approach layers aggressive caching (sd-8) on top of the geo-index: cache 'popular area + category' query results directly, since the same popular queries repeat constantly and the underlying data barely changes minute to minute. Search relevance (blending distance, rating, and review count rather than pure distance) reuses the same candidate-generation-then-scoring shape as sd-54's search ranking — the geo-index narrows to a candidate set cheaply, then a ranking step scores that smaller set."
+          ],
+          diagram: { type: "tree", root: "Nearby search design",
+            children: [
+              { label: "Geo-index (geohash/quadtree/R-tree)", children: [{ label: "Narrows to a candidate set near the query point" }] },
+              { label: "Ranking (distance + rating + reviews)", children: [{ label: "Scores the candidate set, same shape as sd-54" }] },
+              { label: "Aggressive result caching", children: [{ label: "Popular area+category queries repeat; data changes slowly" }] }
+            ]},
+          tricks: [
+            "Contrast explicitly with sd-34: same geospatial toolkit, but write frequency differs — a business location updates rarely, a driver's GPS updates every few seconds, which is why this index can be far more cacheable.",
+            "Caching whole query results (not just individual business records) is the detail worth naming — 'coffee near downtown SF' as a cache key captures a repeating query pattern across many users."
+          ]
+        }},
+      { id: "sd-65", t: "Design a Leaderboard System", d: "Medium",
+        desc: "A narrow, well-defined problem — real-time ranked scores at scale — with one dominant right answer: a sorted-set structure, not a SQL ORDER BY.",
+        notes: {
+          explain: [
+            "The query shape is always some mix of 'what's my rank,' 'show me the top N,' and 'show me the players around my rank' — running ORDER BY + LIMIT/OFFSET over SQL on every score update doesn't hold up at real-time-game scale: every read scans/sorts a large table, and every write invalidates any cached ranking. The standard answer is a sorted-set structure (Redis ZSET, score as sort key, player ID as member) — insert/update is O(log N), and 'top N,' 'rank of X,' and 'range around rank X' are all native O(log N) operations, no separate sort step needed.",
+            "At massive scale (a global leaderboard, hundreds of millions of players), a single sorted set becomes a bottleneck, so the standard extension is sharding the leaderboard (by region/game-mode, usually a real product boundary) and, for a global top-N view across shards, periodically merging each shard's local top-K into a global leaderboard rather than maintaining one live global structure — trading a small staleness window for scalability, the same shape as sd-29's celebrity fan-out-on-read tradeoff."
+          ],
+          diagram: { type: "compare",
+            columns: [
+              { title: "SQL ORDER BY", points: ["Score update = a row UPDATE", "Rank/top-N = ORDER BY + LIMIT scan", "Gets slower as the table grows", "No native 'rank of X' operation"] },
+              { title: "Sorted set (Redis ZSET)", points: ["O(log N) insert/update", "Native O(log N) rank, top-N, range-around-rank", "Purpose-built for this exact query shape", "Shard by region/mode at extreme scale"] }
+            ]},
+          tricks: [
+            "Say 'sorted set,' not 'sort the scores' — naming the structure and its O(log N) guarantee is the concrete signal that separates this from a naive SQL answer.",
+            "For a sharded global leaderboard, merging shard-local top-K periodically (rather than one giant live structure) trades staleness for scalability — the same tradeoff shape as sd-29's celebrity fan-out."
+          ]
+        }},
+      { id: "sd-66", t: "Design a Key-Value Store from Scratch (Dynamo-style)", d: "Hard",
+        desc: "The building block itself, not a system built on top of one — reconstruct the Dynamo paper's core ideas: partitioning, replication, and conflict resolution without a single leader.",
+        notes: {
+          explain: [
+            "Data is partitioned across nodes via consistent hashing (sd-7) — each key maps to a ring position and replicates to the N nodes clockwise from it (its 'preference list'), so adding/removing a node reshuffles only a fraction of keys. Reads and writes use quorum consistency: a write succeeds once W replicas ack, a read is valid once R replicas respond and versions are reconciled, and choosing R + W > N guarantees every read overlaps at least one node that saw the latest write — the same overlap-guarantee logic as Raft's majority quorum (sd-16), applied without a single leader.",
+            "Without a single leader, concurrent writes to the same key can produce conflicting versions — resolved via vector clocks (each version tagged with which nodes contributed, so the system can detect genuinely concurrent versions vs. one superseding another) and either last-write-wins (simple, can silently drop an update) or returning both conflicting versions to the application to merge (Dynamo's original approach). This is a deliberate AP choice on the CAP spectrum (sd-2), not an oversight."
+          ],
+          diagram: { type: "flow",
+            steps: [
+              { label: "Client write", note: "" },
+              { label: "Hash key onto ring", note: "sd-7", arrowLabel: "→" },
+              { label: "Replicate to N nodes", note: "preference list", arrowLabel: "→" },
+              { label: "W acks required", note: "", arrowLabel: "→" },
+              { label: "Read: R replicas", note: "reconcile via vector clock", arrowLabel: "→" }
+            ]},
+          tricks: [
+            "State R + W > N explicitly: it guarantees any read set and write set share at least one node, which is what makes reading the latest write probable without a leader coordinating anything.",
+            "Vector clocks detect concurrent (not just outdated) versions — conflating 'stale' with 'concurrent' is the common mistake; a concurrent version genuinely needs reconciliation because neither causally preceded the other.",
+            "Name this as a deliberate AP system (sd-2) — conflict resolution is pushed to vector clocks + application logic instead of a coordinator refusing writes."
+          ]
+        }},
+      { id: "sd-67", t: "Design a Distributed Job Scheduler / Cron Service", d: "Medium",
+        desc: "Running millions of scheduled jobs reliably across a fleet — the design center is avoiding both duplicate execution and missed execution as workers come and go.",
+        notes: {
+          explain: [
+            "Jobs (cron-style or one-off run-at) are stored durably with their next-run timestamp; a scheduler layer periodically polls for jobs due now and hands each to a worker fleet. The core problem is the same shape as sd-13's idempotency at the scheduling layer: with multiple scheduler instances for availability, two schedulers must never both pick up and execute the same due job — the claim needs to be an atomic conditional update (claim the job, set a lease/lock with a timeout), exactly like the URL shortener's ID-range reservation.",
+            "The lease needs a timeout because a worker can crash mid-execution — if it expires without the job marked complete, another worker must be able to pick it up and retry, which means jobs need to be idempotent wherever possible, with at-least-once execution accepted as the real guarantee rather than promised exactly-once (the same framing as sd-19). At scale, sharding due-job polling by a hash of job ID across scheduler instances avoids the polling step itself becoming the bottleneck."
+          ],
+          diagram: { type: "flow",
+            steps: [
+              { label: "Job due", note: "" },
+              { label: "Atomic lease claim", note: "one scheduler wins", arrowLabel: "→" },
+              { label: "Hand to worker", note: "", arrowLabel: "→" },
+              { label: "Execute", note: "", arrowLabel: "→" },
+              { label: "Complete (release) or lease expires → reclaimed", note: "", arrowLabel: "→" }
+            ]},
+          tricks: [
+            "Say 'atomic conditional claim with a lease timeout,' not 'the scheduler picks it up' — the exact mechanism preventing two replicas from double-executing the same job, the same shape as sd-13.",
+            "True exactly-once execution isn't achievable here any more than in sd-19's pipeline — frame the guarantee as at-least-once plus idempotent jobs, and say so explicitly."
+          ]
+        }},
+      { id: "sd-68", t: "Design Gmail (large-scale email service)", d: "Hard",
+        desc: "Storage at massive scale, full-text search over your own mail, and spam filtering are three fairly separate subsystems bolted together behind one inbox UI.",
+        notes: {
+          explain: [
+            "Each user's mailbox is an append-mostly collection of messages, naturally partitioned by user ID (mail is only ever queried by its owner, which makes sharding trivial compared to something like a social graph) — messages are stored once and referenced by multiple folder/label associations (metadata, not copies), similar in spirit to sd-37's separation of metadata from bytes. Attachments are large blobs in object storage (sd-37), with the message record holding a reference, not the bytes inline.",
+            "Search is a per-user full-text index (the inverted-index approach from sd-54, scoped to one mailbox), updated incrementally as mail arrives. Spam filtering sits in the write path as a scoring step before delivery — a streaming classification pipeline (rules plus an ML model, the same two-stage shape as sd-22's fraud detection) that must run within the mail-delivery latency budget, with borderline messages routed to a spam folder rather than blocked outright so false positives are recoverable."
+          ],
+          diagram: { type: "tree", root: "Gmail-scale subsystems (mostly independent)",
+            children: [
+              { label: "Mailbox storage", children: [{ label: "Partitioned by user ID; labels reference one message, not copies" }] },
+              { label: "Attachments", children: [{ label: "Object storage (sd-37), referenced not inlined" }] },
+              { label: "Per-user search index", children: [{ label: "Inverted index (sd-54) scoped to one mailbox" }] },
+              { label: "Spam filtering", children: [{ label: "In the write path; two-stage scoring like sd-22" }] }
+            ]},
+          tricks: [
+            "Labels/folders as metadata pointing at one stored message (not copies per label) avoids storage blowup for users who label everything — say this when asked how folders work.",
+            "User-ID partitioning is easy here specifically because mail is never queried across users the way a social graph is queried across friends — name why sharding is simple for this data shape, not just that it's sharded by user ID."
+          ]
+        }},
+      { id: "sd-69", t: "Design Instagram (photo/video sharing + feed)", d: "Hard",
+        desc: "Distinct from a generic news feed (sd-29): the design center here is the media pipeline (upload, transcode, multi-resolution serving) as much as the feed fan-out itself.",
+        notes: {
+          explain: [
+            "On upload, the original image/video goes to object storage (sd-37) and is asynchronously processed into multiple resolutions (thumbnail, feed-size, full-res) — similar to sd-32's video transcoding but for images too, so the app never serves an oversized asset to a small thumbnail. Metadata (caption, tags, owner) is stored separately from media bytes, and feed assembly is exactly sd-29's fan-out-on-write-for-most/fan-out-on-read-for-celebrities hybrid, since Instagram has the identical celebrity-follower-count skew.",
+            "The detail generic feed design glosses over: serving the RIGHT resolution to the right client is a CDN-and-negotiation problem layered on top of ranking — the feed-assembly service returns media references, and a CDN (sd-12) serves the actual bytes, choosing resolution via signed URLs or client size hints, so feed-ranking never touches media bytes directly and stays fast. Stories (auto-expiring after 24h) are a straightforward TTL on the same storage, not a separate system."
+          ],
+          diagram: { type: "flow",
+            steps: [
+              { label: "Upload", note: "" },
+              { label: "Object storage", note: "original", arrowLabel: "→" },
+              { label: "Async transcode", note: "multiple resolutions", arrowLabel: "→" },
+              { label: "Feed assembly", note: "fan-out hybrid, sd-29", arrowLabel: "→" },
+              { label: "CDN serves bytes", note: "resolution-matched, sd-12", arrowLabel: "→" }
+            ]},
+          tricks: [
+            "Separate 'which posts appear in the feed' (ranking/fan-out, sd-29) from 'which resolution of this post's image gets served' (CDN/transcode) — folding media serving into the ranking service adds latency to the wrong layer.",
+            "Naming that Instagram has the exact same celebrity fan-out problem as sd-29 (rather than re-deriving it) is efficient and shows you recognize the recurring pattern."
+          ]
+        }},
+      { id: "sd-70", t: "Design a Distributed Lock Service", d: "Hard",
+        desc: "The building block behind 'only one worker should do this at a time' across a fleet — correctness hinges on a detail most candidates miss: a lock alone doesn't guarantee mutual exclusion without a fencing token.",
+        notes: {
+          explain: [
+            "A distributed lock service (built on a consensus system like ZooKeeper/etcd, or Redis for a weaker guarantee) lets a client acquire a named lock, typically with a lease/TTL so a crashed holder doesn't hold it forever. The subtle failure: a client can acquire a lock, then hit a long GC pause or network partition past the lease's TTL — the lock service, hearing nothing, expires and reassigns the lock, but the first client resumes still believing it holds it, and both now act concurrently on the protected resource.",
+            "The fix is a fencing token: every grant includes a monotonically increasing number, and the protected resource itself (not just the lock) must reject any operation carrying a token lower than the highest it has already seen. This pushes the actual safety check to the resource being protected — the only place that can truly enforce it — since the lock service can only ever provide a hint about who currently believes they hold the lock, not a guarantee."
+          ],
+          diagram: { type: "flow",
+            steps: [
+              { label: "Client A acquires", note: "gets fencing token 5" },
+              { label: "Long pause", note: "past lease TTL", arrowLabel: "→" },
+              { label: "Reassigned to B", note: "new token 6", arrowLabel: "→" },
+              { label: "A resumes, writes", note: "stale token 5", arrowLabel: "→" },
+              { label: "Resource rejects A", note: "accepts only token ≥ 6", arrowLabel: "→" }
+            ]},
+          tricks: [
+            "Fencing tokens are the answer to 'what could go wrong with a distributed lock' — say this unprompted; a lock without one is a hint, not a guarantee, once a lease can expire out from under a paused client.",
+            "The check has to happen at the PROTECTED RESOURCE, not by trusting whichever client currently thinks it holds the lock — the lock service alone cannot enforce mutual exclusion once a client can be arbitrarily delayed."
+          ]
+        }},
+      { id: "sd-71", t: "Design a Metrics/Monitoring System (Datadog-style)", d: "Hard",
+        desc: "A time-series ingestion-and-query problem at extreme write volume — the decisions are all about pre-aggregation and cardinality control, not the dashboard UI.",
+        notes: {
+          explain: [
+            "Every host/service emits metrics continuously, so ingestion is enormous and mostly write-only — the standard approach batches and pre-aggregates at the source (a local agent rolls up raw samples into e.g. 10-second buckets before sending) rather than shipping every raw point, trading query-time granularity for a large reduction in network/storage volume, similar in spirit to Kafka producer batching (sd-6). Storage uses a time-series-optimized, delta-encoded columnar format, since time-series data compresses far better than general-purpose row storage.",
+            "The dangerous failure mode at scale is cardinality explosion: a metric tagged by an unbounded dimension (e.g. user ID or request ID) creates a combinatorial number of distinct series, since each unique tag combination is its own series to store and index — this can silently 10-100x storage/query cost and is the most common real production incident in metrics systems. The mitigation is enforcing cardinality limits at ingestion rather than discovering the problem after costs spike. Alerting is a separate consumer reading the same ingested stream and evaluating rules continuously, not polling stored data on a schedule, so alerts fire within seconds of a breach."
+          ],
+          diagram: { type: "tree", root: "Metrics pipeline",
+            children: [
+              { label: "Agent pre-aggregation", children: [{ label: "Rolls up raw samples before sending; less volume, less granularity" }] },
+              { label: "Time-series storage", children: [{ label: "Columnar, delta-encoded, compresses far better than row storage" }] },
+              { label: "Cardinality control at ingestion", children: [{ label: "Unbounded tags explode storage/index cost combinatorially" }] },
+              { label: "Streaming alerting", children: [{ label: "Evaluates rules on the ingest stream, not a scheduled poll" }] }
+            ]},
+          tricks: [
+            "Name cardinality explosion unprompted as THE production risk — easy to cause accidentally (one high-cardinality tag) and expensive to notice late.",
+            "Pre-aggregating at the agent, not the server, is what keeps ingestion tractable — shipping every raw sample just moves the same combinatorial cost to the network and ingestion tier."
+          ]
+        }},
+      { id: "sd-72", t: "Design an Online Code Judge / Sandboxed Execution Service", d: "Hard",
+        desc: "LeetCode/HackerRank-style: running untrusted user code safely, at scale, within a tight time budget — the design center is sandboxing and resource limiting, not the queueing itself.",
+        notes: {
+          explain: [
+            "Submitted code is untrusted by definition, so it runs in an isolated sandbox with hard resource limits — a container or, for stronger isolation, a lightweight VM (gVisor/Firecracker-style microVMs) with strict CPU, memory, disk, and network limits (no network access at all is the common default, since a code judge has no legitimate reason to let submitted code make outbound calls). The submission flow is a job queue (sd-9): a submission is enqueued, a worker pool of ephemeral sandboxes pulls jobs, executes against the test cases with a wall-clock timeout, and reports pass/fail plus resource usage.",
+            "Two things make this harder than a generic job queue: sandbox startup latency matters a lot for UX (waiting 10+ seconds to spin up an isolated environment feels broken for something users expect to feel interactive), which is why a pool of pre-warmed, reusable sandboxes (reset between jobs rather than created fresh) is the standard optimization; and cross-tenant isolation matters because one user's submission must never affect another's execution or see another's data, even running concurrently on shared hardware — a sandbox-escape bug here is a security incident, not just a performance bug."
+          ],
+          diagram: { type: "flow",
+            steps: [
+              { label: "Submission", note: "" },
+              { label: "Enqueue", note: "sd-9", arrowLabel: "→" },
+              { label: "Pre-warmed sandbox pool", note: "", arrowLabel: "→" },
+              { label: "Execute, limits enforced", note: "CPU/mem/time/no network", arrowLabel: "→" },
+              { label: "Report result", note: "pass/fail + resource usage", arrowLabel: "→" }
+            ]},
+          tricks: [
+            "No network access from the sandbox by default is worth stating unprompted — a code judge has no legitimate reason to let submitted code reach the network, and it's a common gap given how much attention goes to CPU/memory limits instead.",
+            "Pre-warmed, reusable sandbox pools directly address cold-start latency, the specific UX problem generic 'spin up a container per job' misses — name the latency reason, not just 'use a pool.'"
           ]
         }}
     ]}
